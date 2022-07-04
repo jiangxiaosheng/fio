@@ -42,6 +42,16 @@ struct rdma_rw_options {
 	char *bindname;
 };
 
+static int str_hostname_cb(void *data, const char *input)
+{
+	struct rdma_rw_options *o = data;
+
+	if (o->td->o.filename)
+		free(o->td->o.filename);
+	o->td->o.filename = strdup(input);
+	return 0;
+}
+
 static struct fio_option options[] = {
 	{
 		.name	= "port",
@@ -53,6 +63,15 @@ static struct fio_option options[] = {
 		.maxval	= 65535,
 		.category = FIO_OPT_C_ENGINE, /* always use this */
 		.group	= FIO_OPT_G_RDMA_RW, /* this can be different */
+	},
+	{
+		.name	= "hostname",
+		.lname	= "rdma engine hostname",
+		.type	= FIO_OPT_STR_STORE,
+		.cb	= str_hostname_cb,
+		.help	= "Hostname for RDMA IO engine",
+		.category = FIO_OPT_C_ENGINE,
+		.group	= FIO_OPT_G_RDMA_RW,
 	},
 	{
 		.name	= "verb",
@@ -95,7 +114,7 @@ struct rdma_rw_info_blk {
 	struct remote_u rmt_us[FIO_RDMA_MAX_IO_DEPTH];
 };
 
-struct rdma_io_u_data {
+struct rdma_rw_u_data {
 	uint64_t wr_id;
 	struct ibv_send_wr sq_wr;
 	struct ibv_recv_wr rq_wr;
@@ -142,70 +161,6 @@ struct rdma_rw_data {
 	struct frand_state rand_state;
 };
 
-/*
- * The ->event() hook is called to match an event number with an io_u.
- * After the core has called ->getevents() and it has returned eg 3,
- * the ->event() hook must return the 3 events that have completed for
- * subsequent calls to ->event() with [0-2]. Required.
- */
-static struct io_u *fio_rdma_rw_event(struct thread_data *td, int event)
-{
-	return NULL;
-}
-
-/*
- * The ->getevents() hook is used to reap completion events from an async
- * io engine. It returns the number of completed events since the last call,
- * which may then be retrieved by calling the ->event() hook with the event
- * numbers. Required.
- */
-static int fio_rdma_rw_getevents(struct thread_data *td, unsigned int min,
-				  unsigned int max, const struct timespec *t)
-{
-	return 0;
-}
-
-/*
- * The ->queue() hook is responsible for initiating io on the io_u
- * being passed in. If the io engine is a synchronous one, io may complete
- * before ->queue() returns. Required.
- *
- * The io engine must transfer in the direction noted by io_u->ddir
- * to the buffer pointed to by io_u->xfer_buf for as many bytes as
- * io_u->xfer_buflen. Residual data count may be set in io_u->resid
- * for a short read/write.
- */
-static enum fio_q_status fio_rdma_rw_queue(struct thread_data *td,
-					    struct io_u *io_u)
-{
-	/*
-	 * Double sanity check to catch errant write on a readonly setup
-	 */
-	fio_ro_check(td, io_u);
-
-	/*
-	 * Could return FIO_Q_QUEUED for a queued request,
-	 * FIO_Q_COMPLETED for a completed request, and FIO_Q_BUSY
-	 * if we could queue no more at this point (you'd have to
-	 * define ->commit() to handle that.
-	 */
-	return FIO_Q_COMPLETED;
-}
-
-
-static int fio_rdma_rw_commit(struct thread_data *td) {
-	return 0;
-}
-
-/*
- * The ->prep() function is called for each io_u prior to being submitted
- * with ->queue(). This hook allows the io engine to perform any
- * preparatory actions on the io_u, before being submitted. Not required.
- */
-static int fio_rdma_rw_prep(struct thread_data *td, struct io_u *io_u)
-{
-	return 0;
-}
 
 static int fio_rdma_rw_setup(struct thread_data *td) {
 	struct rdma_rw_data *rd;
@@ -568,7 +523,7 @@ static int fio_rdma_rw_init(struct thread_data *td)
 	}
 
 	if ((rd->rdma_protocol == FIO_RDMA_RW_WRITE) ||
-	    (rd->rdma_protocol == FIO_RDMA_RW_WRITE)) {
+	    (rd->rdma_protocol == FIO_RDMA_RW_READ)) {
 		rd->rmt_us =
 			malloc(FIO_RDMA_MAX_IO_DEPTH * sizeof(struct remote_u));
 		memset(rd->rmt_us, 0,
@@ -614,9 +569,9 @@ static int fio_rdma_rw_post_init(struct thread_data *td)
 	for (i = 0; i < td->io_u_freelist.nr; i++) {
 		struct io_u *io_u = td->io_u_freelist.io_us[i];
 
-		io_u->engine_data = malloc(sizeof(struct rdma_io_u_data));
-		memset(io_u->engine_data, 0, sizeof(struct rdma_io_u_data));
-		((struct rdma_io_u_data *)io_u->engine_data)->wr_id = i;
+		io_u->engine_data = malloc(sizeof(struct rdma_rw_u_data));
+		memset(io_u->engine_data, 0, sizeof(struct rdma_rw_u_data));
+		((struct rdma_rw_u_data *)io_u->engine_data)->wr_id = i;
 
 		io_u->mr = ibv_reg_mr(rd->pd, io_u->buf, max_bs,
 				      IBV_ACCESS_LOCAL_WRITE |
@@ -638,6 +593,595 @@ static int fio_rdma_rw_post_init(struct thread_data *td)
 	return 0;
 }
 
+static int client_recv(struct thread_data *td, struct ibv_wc *wc)
+{
+	struct rdma_rw_data *rd = td->io_ops_data;
+	unsigned int max_bs;
+
+	if (wc->byte_len != sizeof(rd->recv_buf)) {
+		log_err("Received bogus data, size %d\n", wc->byte_len);
+		return 1;
+	}
+
+	max_bs = max(td->o.max_bs[DDIR_READ], td->o.max_bs[DDIR_WRITE]);
+	if (max_bs > ntohl(rd->recv_buf.max_bs)) {
+		log_err("fio: Server's block size (%d) must be greater than or "
+			"equal to the client's block size (%d)!\n",
+			ntohl(rd->recv_buf.max_bs), max_bs);
+		return 1;
+	}
+
+	/* store mr info for MEMORY semantic */
+	if ((rd->rdma_protocol == FIO_RDMA_RW_WRITE) ||
+	    (rd->rdma_protocol == FIO_RDMA_RW_READ)) {
+		/* struct flist_head *entry; */
+		int i = 0;
+
+		rd->rmt_nr = ntohl(rd->recv_buf.nr);
+
+		for (i = 0; i < rd->rmt_nr; i++) {
+			rd->rmt_us[i].buf = __be64_to_cpu(
+						rd->recv_buf.rmt_us[i].buf);
+			rd->rmt_us[i].rkey = ntohl(rd->recv_buf.rmt_us[i].rkey);
+			rd->rmt_us[i].size = ntohl(rd->recv_buf.rmt_us[i].size);
+
+			dprint(FD_IO,
+			       "fio: Received rkey %x addr %" PRIx64
+			       " len %d from peer\n", rd->rmt_us[i].rkey,
+			       rd->rmt_us[i].buf, rd->rmt_us[i].size);
+		}
+	}
+
+	return 0;
+}
+
+static int server_recv(struct thread_data *td, struct ibv_wc *wc)
+{
+	struct rdma_rw_data *rd = td->io_ops_data;
+	unsigned int max_bs;
+
+	if (wc->wr_id == FIO_RDMA_MAX_IO_DEPTH) {
+		rd->rdma_protocol = ntohl(rd->recv_buf.mode);
+
+		max_bs = max(td->o.max_bs[DDIR_READ], td->o.max_bs[DDIR_WRITE]);
+		if (max_bs < ntohl(rd->recv_buf.max_bs)) {
+			log_err("fio: Server's block size (%d) must be greater than or "
+				"equal to the client's block size (%d)!\n",
+				ntohl(rd->recv_buf.max_bs), max_bs);
+			return 1;
+		}
+
+	}
+
+	return 0;
+}
+
+static int cq_event_handler(struct thread_data *td, enum ibv_wc_opcode opcode)
+{
+	struct rdma_rw_data *rd = td->io_ops_data;
+	struct ibv_wc wc;
+	struct rdma_rw_u_data *r_io_u_d;
+	int ret;
+	int compevnum = 0;
+	int i;
+
+	while ((ret = ibv_poll_cq(rd->cq, 1, &wc)) == 1) {
+		ret = 0;
+		compevnum++;
+
+		if (wc.status) {
+			log_err("fio: cq completion status %d(%s)\n",
+				wc.status, ibv_wc_status_str(wc.status));
+			return -1;
+		}
+
+		switch (wc.opcode) {
+
+		case IBV_WC_RECV:
+			if (rd->is_client == 1)
+				ret = client_recv(td, &wc);
+			else
+				ret = server_recv(td, &wc);
+
+			if (ret)
+				return -1;
+
+			if (wc.wr_id == FIO_RDMA_MAX_IO_DEPTH)
+				break;
+
+			for (i = 0; i < rd->io_u_flight_nr; i++) {
+				r_io_u_d = rd->io_us_flight[i]->engine_data;
+
+				if (wc.wr_id == r_io_u_d->rq_wr.wr_id) {
+					rd->io_us_flight[i]->resid =
+					    rd->io_us_flight[i]->buflen
+					    - wc.byte_len;
+
+					rd->io_us_flight[i]->error = 0;
+
+					rd->io_us_completed[rd->
+							    io_u_completed_nr]
+					    = rd->io_us_flight[i];
+					rd->io_u_completed_nr++;
+					break;
+				}
+			}
+			if (i == rd->io_u_flight_nr)
+				log_err("fio: recv wr %" PRId64 " not found\n",
+					wc.wr_id);
+			else {
+				/* put the last one into middle of the list */
+				rd->io_us_flight[i] =
+				    rd->io_us_flight[rd->io_u_flight_nr - 1];
+				rd->io_u_flight_nr--;
+			}
+
+			break;
+
+		case IBV_WC_SEND:
+		case IBV_WC_RDMA_WRITE:
+		case IBV_WC_RDMA_READ:
+			if (wc.wr_id == FIO_RDMA_MAX_IO_DEPTH)
+				break;
+
+			for (i = 0; i < rd->io_u_flight_nr; i++) {
+				r_io_u_d = rd->io_us_flight[i]->engine_data;
+
+				if (wc.wr_id == r_io_u_d->sq_wr.wr_id) {
+					rd->io_us_completed[rd->io_u_completed_nr] 
+							= rd->io_us_flight[i];
+					rd->io_u_completed_nr++;
+					break;
+				}
+			}
+			if (i == rd->io_u_flight_nr)
+				log_err("fio: send wr %" PRId64 " not found\n",
+					wc.wr_id);
+			else {
+				/* put the last one into middle of the list */
+				rd->io_us_flight[i] =
+				    rd->io_us_flight[rd->io_u_flight_nr - 1];
+				rd->io_u_flight_nr--;
+			}
+
+			break;
+
+		default:
+			log_info("fio: unknown completion event %d\n",
+				 wc.opcode);
+			return -1;
+		}
+		rd->cq_event_num++;
+	}
+
+	if (ret) {
+		log_err("fio: poll error %d\n", ret);
+		return 1;
+	}
+
+	return compevnum;
+}
+
+/*
+ * Return -1 for error and 'nr events' for a positive number
+ * of events
+ */
+static int rdma_poll_wait(struct thread_data *td, enum ibv_wc_opcode opcode)
+{
+	struct rdma_rw_data *rd = td->io_ops_data;
+	struct ibv_cq *ev_cq;
+	void *ev_ctx;
+	int ret;
+
+	if (rd->cq_event_num > 0) {	/* previous left */
+		rd->cq_event_num--;
+		return 0;
+	}
+
+again:
+	// may block
+	if (ibv_get_cq_event(rd->channel, &ev_cq, &ev_ctx) != 0) {
+		log_err("fio: Failed to get cq event!\n");
+		return -1;
+	}
+	if (ev_cq != rd->cq) {
+		log_err("fio: Unknown CQ!\n");
+		return -1;
+	}
+	if (ibv_req_notify_cq(rd->cq, 0) != 0) {
+		log_err("fio: Failed to set notify!\n");
+		return -1;
+	}
+
+	ret = cq_event_handler(td, opcode);
+	if (ret == 0)
+		goto again;
+
+	ibv_ack_cq_events(rd->cq, ret);
+
+	rd->cq_event_num--;
+
+	return ret;
+}
+
+static int fio_rdma_rw_accept(struct thread_data *td, struct fio_file *f)
+{
+	struct rdma_rw_data *rd = td->io_ops_data;
+	struct rdma_conn_param conn_param;
+	struct ibv_send_wr *bad_wr;
+	int ret = 0;
+
+	/* rdma_accept() - then wait for accept success */
+	memset(&conn_param, 0, sizeof(conn_param));
+	conn_param.responder_resources = 1;
+	conn_param.initiator_depth = 1;
+
+	if (rdma_accept(rd->child_cm_id, &conn_param) != 0) {
+		log_err("fio: rdma_accept: %m\n");
+		return 1;
+	}
+
+	if (get_next_channel_event
+	    (td, rd->cm_channel, RDMA_CM_EVENT_ESTABLISHED) != 0) {
+		log_err("fio: wait for RDMA_CM_EVENT_ESTABLISHED\n");
+		return 1;
+	}
+
+	/* wait for request */
+	ret = rdma_poll_wait(td, IBV_WC_RECV) < 0;
+
+	if (ibv_post_send(rd->qp, &rd->sq_wr, &bad_wr) != 0) {
+		log_err("fio: ibv_post_send fail: %m\n");
+		return 1;
+	}
+
+	if (rdma_poll_wait(td, IBV_WC_SEND) < 0)
+		return 1;
+
+	return ret;
+}
+
+static int fio_rdma_rw_connect(struct thread_data *td, struct fio_file *f)
+{
+	struct rdma_rw_data *rd = td->io_ops_data;
+	struct rdma_conn_param conn_param;
+	struct ibv_send_wr *bad_wr;
+
+	memset(&conn_param, 0, sizeof(conn_param));
+	conn_param.responder_resources = 1;
+	conn_param.initiator_depth = 1;
+	conn_param.retry_count = 10;
+
+	if (rdma_connect(rd->cm_id, &conn_param) != 0) {
+		log_err("fio: rdma_connect fail: %m\n");
+		return 1;
+	}
+
+	if (get_next_channel_event
+	    (td, rd->cm_channel, RDMA_CM_EVENT_ESTABLISHED) != 0) {
+		log_err("fio: wait for RDMA_CM_EVENT_ESTABLISHED\n");
+		return 1;
+	}
+
+	/* send task request */
+	rd->send_buf.mode = htonl(rd->rdma_protocol);
+	rd->send_buf.nr = htonl(td->o.iodepth);
+
+	if (ibv_post_send(rd->qp, &rd->sq_wr, &bad_wr) != 0) {
+		log_err("fio: ibv_post_send fail: %m\n");
+		return 1;
+	}
+
+	if (rdma_poll_wait(td, IBV_WC_SEND) < 0)
+		return 1;
+
+	/* wait for remote MR info from server side */
+	if (rdma_poll_wait(td, IBV_WC_RECV) < 0)
+		return 1;
+
+	/* In SEND/RECV test, it's a good practice to setup the iodepth of
+	 * of the RECV side deeper than that of the SEND side to
+	 * avoid RNR (receiver not ready) error. The
+	 * SEND side may send so many unsolicited message before
+	 * RECV side commits sufficient recv buffers into recv queue.
+	 * This may lead to RNR error. Here, SEND side pauses for a while
+	 * during which RECV side commits sufficient recv buffers.
+	 */
+	usleep(500000);
+
+	return 0;
+}
+
+static int fio_rdma_rw_open_file(struct thread_data *td, struct fio_file *f)
+{
+	if (td_read(td))
+		return fio_rdma_rw_accept(td, f);
+	else
+		return fio_rdma_rw_connect(td, f);
+}
+
+
+/*
+ * The ->prep() function is called for each io_u prior to being submitted
+ * with ->queue(). This hook allows the io engine to perform any
+ * preparatory actions on the io_u, before being submitted. Not required.
+ */
+static int fio_rdma_rw_prep(struct thread_data *td, struct io_u *io_u)
+{
+	struct rdma_rw_data *rd = td->io_ops_data;
+	struct rdma_rw_u_data *r_io_u_d;
+
+	r_io_u_d = io_u->engine_data;
+
+	switch (rd->rdma_protocol) {
+	case FIO_RDMA_RW_WRITE:
+	case FIO_RDMA_RW_READ:
+		r_io_u_d->rdma_sgl.addr = (uint64_t) (unsigned long)io_u->buf;
+		r_io_u_d->rdma_sgl.lkey = io_u->mr->lkey;
+		r_io_u_d->sq_wr.wr_id = r_io_u_d->wr_id;
+		r_io_u_d->sq_wr.send_flags = IBV_SEND_SIGNALED;
+		r_io_u_d->sq_wr.sg_list = &r_io_u_d->rdma_sgl;
+		r_io_u_d->sq_wr.num_sge = 1;
+		break;
+	default:
+		log_err("fio: unknown rdma protocol - %d\n", rd->rdma_protocol);
+		break;
+	}
+
+	return 0;
+}
+
+/*
+ * The ->event() hook is called to match an event number with an io_u.
+ * After the core has called ->getevents() and it has returned eg 3,
+ * the ->event() hook must return the 3 events that have completed for
+ * subsequent calls to ->event() with [0-2]. Required.
+ */
+static struct io_u *fio_rdma_rw_event(struct thread_data *td, int event)
+{
+	struct rdma_rw_data *rd = td->io_ops_data;
+	struct io_u *io_u;
+	int i;
+
+	io_u = rd->io_us_completed[0];
+	for (i = 0; i < rd->io_u_completed_nr - 1; i++)
+		rd->io_us_completed[i] = rd->io_us_completed[i + 1];
+
+	rd->io_u_completed_nr--;
+
+	dprint_io_u(io_u, "fio_rdmaio_event");
+
+	return io_u;
+}
+
+/*
+ * The ->getevents() hook is used to reap completion events from an async
+ * io engine. It returns the number of completed events since the last call,
+ * which may then be retrieved by calling the ->event() hook with the event
+ * numbers. Required.
+ */
+static int fio_rdma_rw_getevents(struct thread_data *td, unsigned int min,
+				  unsigned int max, const struct timespec *t)
+{
+	struct rdma_rw_data *rd = td->io_ops_data;
+	enum ibv_wc_opcode comp_opcode;
+	struct ibv_cq *ev_cq;
+	void *ev_ctx;
+	int ret, r = 0;
+	comp_opcode = IBV_WC_RDMA_WRITE;
+
+	switch (rd->rdma_protocol) {
+	case FIO_RDMA_RW_WRITE:
+		comp_opcode = IBV_WC_RDMA_WRITE;
+		break;
+	case FIO_RDMA_RW_READ:
+		comp_opcode = IBV_WC_RDMA_READ;
+		break;
+	default:
+		log_err("fio: unknown rdma protocol - %d\n", rd->rdma_protocol);
+		break;
+	}
+
+	if (rd->cq_event_num > 0) {	/* previous left */
+		rd->cq_event_num--;
+		return 0;
+	}
+
+again:
+	if (ibv_get_cq_event(rd->channel, &ev_cq, &ev_ctx) != 0) {
+		log_err("fio: Failed to get cq event!\n");
+		return -1;
+	}
+	if (ev_cq != rd->cq) {
+		log_err("fio: Unknown CQ!\n");
+		return -1;
+	}
+	if (ibv_req_notify_cq(rd->cq, 0) != 0) {
+		log_err("fio: Failed to set notify!\n");
+		return -1;
+	}
+
+	ret = cq_event_handler(td, comp_opcode);
+	if (ret < 1)
+		goto again;
+
+	ibv_ack_cq_events(rd->cq, ret);
+
+	r += ret;
+	if (r < min)
+		goto again;
+
+	rd->cq_event_num -= r;
+
+	return r;
+}
+
+/*
+ * The ->queue() hook is responsible for initiating io on the io_u
+ * being passed in. If the io engine is a synchronous one, io may complete
+ * before ->queue() returns. Required.
+ *
+ * The io engine must transfer in the direction noted by io_u->ddir
+ * to the buffer pointed to by io_u->xfer_buf for as many bytes as
+ * io_u->xfer_buflen. Residual data count may be set in io_u->resid
+ * for a short read/write.
+ */
+static enum fio_q_status fio_rdma_rw_queue(struct thread_data *td,
+					    struct io_u *io_u)
+{
+	struct rdma_rw_data *rd = td->io_ops_data;
+
+	fio_ro_check(td, io_u);
+
+	if (rd->io_u_queued_nr == (int)td->o.iodepth)
+		return FIO_Q_BUSY;
+
+	rd->io_us_queued[rd->io_u_queued_nr] = io_u;
+	rd->io_u_queued_nr++;
+
+	dprint_io_u(io_u, "fio_rdmaio_queue");
+
+	return FIO_Q_QUEUED;
+}
+
+static int fio_rdma_rw_send(struct thread_data *td, struct io_u **io_us,
+			   unsigned int nr)
+{
+	struct rdma_rw_data *rd = td->io_ops_data;
+	struct ibv_send_wr *bad_wr;
+#if 0
+	enum ibv_wc_opcode comp_opcode;
+	comp_opcode = IBV_WC_RDMA_WRITE;
+#endif
+	int i;
+	long index;
+	struct rdma_rw_u_data *r_io_u_d;
+
+	r_io_u_d = NULL;
+
+	for (i = 0; i < nr; i++) {
+		/* RDMA_WRITE or RDMA_READ */
+		switch (rd->rdma_protocol) {
+		case FIO_RDMA_RW_WRITE:
+			/* compose work request */
+			r_io_u_d = io_us[i]->engine_data;
+			index = __rand(&rd->rand_state) % rd->rmt_nr;
+			r_io_u_d->sq_wr.opcode = IBV_WR_RDMA_WRITE;
+			r_io_u_d->sq_wr.wr.rdma.rkey = rd->rmt_us[index].rkey;
+			r_io_u_d->sq_wr.wr.rdma.remote_addr = \
+				rd->rmt_us[index].buf;
+			r_io_u_d->sq_wr.sg_list->length = io_us[i]->buflen;
+			break;
+		case FIO_RDMA_RW_READ:
+			/* compose work request */
+			r_io_u_d = io_us[i]->engine_data;
+			index = __rand(&rd->rand_state) % rd->rmt_nr;
+			r_io_u_d->sq_wr.opcode = IBV_WR_RDMA_READ;
+			r_io_u_d->sq_wr.wr.rdma.rkey = rd->rmt_us[index].rkey;
+			r_io_u_d->sq_wr.wr.rdma.remote_addr = \
+				rd->rmt_us[index].buf;
+			r_io_u_d->sq_wr.sg_list->length = io_us[i]->buflen;
+			break;
+		default:
+			log_err("fio: unknown rdma protocol - %d\n",
+				rd->rdma_protocol);
+			break;
+		}
+
+		if (ibv_post_send(rd->qp, &r_io_u_d->sq_wr, &bad_wr) != 0) {
+			log_err("fio: ibv_post_send fail: %m\n");
+			return -1;
+		}
+
+		dprint_io_u(io_us[i], "fio_rdmaio_send");
+	}
+
+	/* wait for completion
+	   rdma_poll_wait(td, comp_opcode); */
+
+	return i;
+}
+
+static int fio_rdma_rw_recv(struct thread_data *td, struct io_u **io_us,
+			   unsigned int nr)
+{
+	struct rdma_rw_data *rd = td->io_ops_data;
+	struct ibv_recv_wr *bad_wr;
+	
+	/* re-post the rq_wr */
+	if (ibv_post_recv(rd->qp, &rd->rq_wr, &bad_wr) != 0) {
+		log_err("fio: ibv_post_recv fail: %m\n");
+		return 1;
+	}
+
+	rdma_poll_wait(td, IBV_WC_RECV);
+
+	dprint(FD_IO, "fio: recv FINISH message\n");
+	td->done = 1;
+	return 0;
+}
+
+static void fio_rdma_rw_queued(struct thread_data *td, struct io_u **io_us,
+			      unsigned int nr)
+{
+	struct rdma_rw_data *rd = td->io_ops_data;
+	struct timespec now;
+	unsigned int i;
+
+	if (!fio_fill_issue_time(td))
+		return;
+
+	fio_gettime(&now, NULL);
+
+	for (i = 0; i < nr; i++) {
+		struct io_u *io_u = io_us[i];
+
+		/* queued -> flight */
+		rd->io_us_flight[rd->io_u_flight_nr] = io_u;
+		rd->io_u_flight_nr++;
+
+		memcpy(&io_u->issue_time, &now, sizeof(now));
+		io_u_queued(td, io_u);
+	}
+
+	/*
+	 * only used for iolog
+	 */
+	if (td->o.read_iolog_file)
+		memcpy(&td->last_issue, &now, sizeof(now));
+}
+
+static int fio_rdma_rw_commit(struct thread_data *td) {
+	struct rdma_rw_data *rd = td->io_ops_data;
+	struct io_u **io_us;
+	int ret;
+
+	if (!rd->io_us_queued)
+		return 0;
+
+	io_us = rd->io_us_queued;
+	do {
+		/* RDMA_WRITE or RDMA_READ */
+		if (rd->is_client)
+			ret = fio_rdma_rw_send(td, io_us, rd->io_u_queued_nr);
+		else if (!rd->is_client)
+			ret = fio_rdma_rw_recv(td, io_us, rd->io_u_queued_nr);
+		else
+			ret = 0;	/* must be a SYNC */
+
+		if (ret > 0) {
+			fio_rdma_rw_queued(td, io_us, ret);
+			io_u_mark_submit(td, ret);
+			rd->io_u_queued_nr -= ret;
+			io_us += ret;
+			ret = 0;
+		} else
+			break;
+	} while (rd->io_u_queued_nr);
+
+	return ret;
+}
+
 /*
  * This is paired with the ->init() function and is called when a thread is
  * done doing io. Should tear down anything setup by the ->init() function.
@@ -652,20 +1196,52 @@ static void fio_rdma_rw_cleanup(struct thread_data *td)
 }
 
 /*
- * Hook for opening the given file. Unless the engine has special
- * needs, it usually just provides generic_open_file() as the handler.
- */
-static int fio_rdma_rw_open(struct thread_data *td, struct fio_file *f)
-{
-	return generic_open_file(td, f);
-}
-
-/*
  * Hook for closing a file. See fio_skeleton_open().
  */
 static int fio_rdma_rw_close(struct thread_data *td, struct fio_file *f)
 {
-	return generic_close_file(td, f);
+	struct rdma_rw_data *rd = td->io_ops_data;
+	struct ibv_send_wr *bad_wr;
+
+	/* unregister rdma buffer */
+
+	/*
+	 * Client sends notification to the server side
+	 */
+	/* refer to: http://linux.die.net/man/7/rdma_cm */
+	if ((rd->is_client == 1) && ((rd->rdma_protocol == FIO_RDMA_RW_READ)
+				     || (rd->rdma_protocol ==
+					 FIO_RDMA_RW_READ))) {
+		if (ibv_post_send(rd->qp, &rd->sq_wr, &bad_wr) != 0) {
+			log_err("fio: ibv_post_send fail: %m\n");
+			return 1;
+		}
+
+		dprint(FD_IO, "fio: close information sent success\n");
+		rdma_poll_wait(td, IBV_WC_SEND);
+	}
+
+	if (rd->is_client == 1)
+		rdma_disconnect(rd->cm_id);
+	else {
+		rdma_disconnect(rd->child_cm_id);
+	}
+
+
+	ibv_destroy_cq(rd->cq);
+	ibv_destroy_qp(rd->qp);
+
+	if (rd->is_client == 1)
+		rdma_destroy_id(rd->cm_id);
+	else {
+		rdma_destroy_id(rd->child_cm_id);
+		rdma_destroy_id(rd->cm_id);
+	}
+
+	ibv_destroy_comp_channel(rd->channel);
+	ibv_dealloc_pd(rd->pd);
+
+	return 0;
 }
 
 
@@ -678,15 +1254,17 @@ struct ioengine_ops ioengine = {
 	.version	= FIO_IOOPS_VERSION,
 	.setup		= fio_rdma_rw_setup,
 	.init		= fio_rdma_rw_init,
-	.prep		= fio_rdma_rw_prep,
 	.post_init	= fio_rdma_rw_post_init,
+	.prep		= fio_rdma_rw_prep,
 	.queue		= fio_rdma_rw_queue,
 	.commit		= fio_rdma_rw_commit,
 	.getevents	= fio_rdma_rw_getevents,
 	.event		= fio_rdma_rw_event,
 	.cleanup	= fio_rdma_rw_cleanup,
-	.open_file	= fio_rdma_rw_open,
+	.open_file	= fio_rdma_rw_open_file,
 	.close_file	= fio_rdma_rw_close,
+	.flags		= FIO_DISKLESSIO | FIO_UNIDIR | FIO_PIPEIO |
+					FIO_ASYNCIO_SETS_ISSUE_TIME,
 	.options	= options,
 	.option_struct_size	= sizeof(struct rdma_rw_options),
 };
