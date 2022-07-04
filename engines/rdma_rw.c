@@ -40,6 +40,7 @@ struct rdma_rw_options {
 	unsigned int port;
 	enum rdma_rw_mode verb;
 	char *bindname;
+	unsigned int flushsize;
 };
 
 static int str_hostname_cb(void *data, const char *input)
@@ -93,6 +94,15 @@ static struct fio_option options[] = {
 		},
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_RDMA_RW,
+	},
+	{
+		.name		= "flushsize",
+		.lname		= "RDMA-rw flush size",
+		.type		= FIO_OPT_STR_VAL,
+		.off1		= offsetof(struct rdma_rw_options, flushsize),
+		.help		= "flush size for RDMA-rw",
+		.category	= FIO_OPT_C_ENGINE,
+		.group		= FIO_OPT_G_RDMA_RW,
 	},
 	{
 		.name	= NULL,
@@ -491,6 +501,8 @@ static int fio_rdma_rw_init(struct thread_data *td)
 	struct rdma_rw_options *o = td->eo;
 	int ret;
 
+	log_info("flushsize: %d\n", o->flushsize);
+
 	if (td_rw(td)) {
 		log_err("fio: rdma connections must be read OR write\n");
 		return 1;
@@ -724,6 +736,7 @@ static int cq_event_handler(struct thread_data *td, enum ibv_wc_opcode opcode)
 			if (wc.wr_id == FIO_RDMA_MAX_IO_DEPTH)
 				break;
 
+			// find the io_u in flight that matches the wr_id
 			for (i = 0; i < rd->io_u_flight_nr; i++) {
 				r_io_u_d = rd->io_us_flight[i]->engine_data;
 
@@ -1002,6 +1015,7 @@ again:
 	}
 
 	ret = cq_event_handler(td, comp_opcode);
+
 	if (ret < 1)
 		goto again;
 
@@ -1049,16 +1063,13 @@ static int fio_rdma_rw_send(struct thread_data *td, struct io_u **io_us,
 {
 	struct rdma_rw_data *rd = td->io_ops_data;
 	struct ibv_send_wr *bad_wr;
-#if 0
-	enum ibv_wc_opcode comp_opcode;
-	comp_opcode = IBV_WC_RDMA_WRITE;
-#endif
 	int i;
 	long index;
 	struct rdma_rw_u_data *r_io_u_d;
 
 	r_io_u_d = NULL;
 
+	// consume the io_u in rd->io_us_queued, nr = io_u_queued_nr
 	for (i = 0; i < nr; i++) {
 		/* RDMA_WRITE or RDMA_READ */
 		switch (rd->rdma_protocol) {
@@ -1113,7 +1124,7 @@ static int fio_rdma_rw_recv(struct thread_data *td, struct io_u **io_us,
 		log_err("fio: ibv_post_recv fail: %m\n");
 		return 1;
 	}
-
+	
 	rdma_poll_wait(td, IBV_WC_RECV);
 
 	dprint(FD_IO, "fio: recv FINISH message\n");
@@ -1198,7 +1209,7 @@ static void fio_rdma_rw_cleanup(struct thread_data *td)
 /*
  * Hook for closing a file. See fio_skeleton_open().
  */
-static int fio_rdma_rw_close(struct thread_data *td, struct fio_file *f)
+static int fio_rdma_rw_close_file(struct thread_data *td, struct fio_file *f)
 {
 	struct rdma_rw_data *rd = td->io_ops_data;
 	struct ibv_send_wr *bad_wr;
@@ -1262,7 +1273,7 @@ struct ioengine_ops ioengine = {
 	.event		= fio_rdma_rw_event,
 	.cleanup	= fio_rdma_rw_cleanup,
 	.open_file	= fio_rdma_rw_open_file,
-	.close_file	= fio_rdma_rw_close,
+	.close_file	= fio_rdma_rw_close_file,
 	.flags		= FIO_DISKLESSIO | FIO_UNIDIR | FIO_PIPEIO |
 					FIO_ASYNCIO_SETS_ISSUE_TIME,
 	.options	= options,

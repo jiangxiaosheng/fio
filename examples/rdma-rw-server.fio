@@ -4,6 +4,7 @@ ioengine=external:/users/sjiang/nvmeof-project/fio/engines/rdma_rw.o
 port=9876
 bs=2k
 size=10g
+flushsize=2m
 
 [receiver]
 rw=read
