@@ -14,19 +14,28 @@
 #include <errno.h>
 #include <assert.h>
 #include <netdb.h>
+#include <semaphore.h>
 
 #include "../fio.h"
 #include "../optgroup.h"
 
 #include <rdma/rdma_cma.h>
+#include <rdma/rdma_verbs.h>
 
 #define GOLDEN_RATIO_PRIME 0x9e37fffffffc0001UL
 
 #define FIO_RDMA_MAX_IO_DEPTH    512
 
+
 enum rdma_rw_mode {
 	FIO_RDMA_RW_READ,
 	FIO_RDMA_RW_WRITE,
+};
+
+enum rdma_rw_control_opcode {
+	FLUSH_WR_ID,
+	FLUSH_ACK_WR_ID,
+	END_WR_ID,
 };
 
 /*
@@ -115,6 +124,10 @@ struct remote_u {
 	uint32_t size;
 };
 
+struct rdma_rw_flush_info_blk {
+	enum rdma_rw_control_opcode opcode;
+};
+
 struct rdma_rw_info_blk {
 	uint32_t mode;		/* channel semantic or memory semantic */
 	uint32_t nr;		/* client: io depth
@@ -169,6 +182,26 @@ struct rdma_rw_data {
 	int io_u_completed_nr;
 
 	struct frand_state rand_state;
+
+	// rdma-rw specific
+	void *flush_buf;
+	size_t cached_len;
+	sem_t server_end_sem;
+	size_t flushsize;
+	struct rdma_cm_id *flush_listen_cm_id;
+	struct rdma_cm_id *flush_cm_id;
+	struct rdma_event_channel *flush_cm_channel;
+	struct ibv_cq *flush_cq;
+	struct ibv_qp *flush_qp;
+	struct ibv_pd *flush_pd;
+	struct ibv_send_wr flush_sq_wr;
+	struct ibv_recv_wr flush_rq_wr;
+	struct ibv_mr *flush_send_mr;
+	struct ibv_mr *flush_recv_mr;
+	struct rdma_rw_flush_info_blk flush_recv_buf;
+	struct rdma_rw_flush_info_blk flush_send_buf;
+	struct ibv_sge flush_recv_sgl;
+	struct ibv_sge flush_send_sgl;
 };
 
 
@@ -194,7 +227,7 @@ static int fio_rdma_rw_setup(struct thread_data *td) {
 
 static int get_next_channel_event(struct thread_data *td,
 				  struct rdma_event_channel *channel,
-				  enum rdma_cm_event_type wait_event)
+				  enum rdma_cm_event_type wait_event, int flush_channel)
 {
 	struct rdma_rw_data *rd = td->io_ops_data;
 	struct rdma_cm_event *event;
@@ -215,7 +248,10 @@ static int get_next_channel_event(struct thread_data *td,
 
 	switch (event->event) {
 	case RDMA_CM_EVENT_CONNECT_REQUEST:
-		rd->child_cm_id = event->id;
+		if (!flush_channel)
+			rd->child_cm_id = event->id;
+		else
+			rd->flush_cm_id = event->id;
 		break;
 	default:
 		break;
@@ -323,6 +359,54 @@ err1:
 	return 1;
 }
 
+static int fio_rdma_rw_setup_flush_qp(struct thread_data *td)
+{
+	struct rdma_rw_data *rd = td->io_ops_data;
+	struct ibv_qp_init_attr init_attr;
+	int qp_depth = 2;
+
+	rd->flush_pd = ibv_alloc_pd(rd->flush_cm_id->verbs);
+
+	if (rd->flush_pd == NULL) {
+		log_err("fio: ibv_alloc_pd fail: %m\n");
+		return 1;
+	}
+
+	rd->flush_cq = ibv_create_cq(rd->cm_id->verbs,
+				       qp_depth, rd, NULL, 0);
+	if (rd->flush_cq == NULL) {
+		log_err("fio: ibv_create_cq failed: %m\n");
+		goto err2;
+	}
+
+	/* create queue pair */
+	memset(&init_attr, 0, sizeof(init_attr));
+	init_attr.cap.max_send_wr = qp_depth;
+	init_attr.cap.max_recv_wr = qp_depth;
+	init_attr.cap.max_recv_sge = 1;
+	init_attr.cap.max_send_sge = 1;
+	init_attr.qp_type = IBV_QPT_RC;
+	init_attr.send_cq = rd->flush_cq;
+	init_attr.recv_cq = rd->flush_cq;
+
+	if (rdma_create_qp(rd->flush_cm_id, rd->pd, &init_attr) != 0) {
+		log_err("fio: rdma_create_qp failed: %m\n");
+		goto err3;
+	}
+	rd->flush_qp = rd->flush_cm_id->qp;
+
+	return 0;
+
+err3:
+	ibv_destroy_cq(rd->cq);
+err2:
+	ibv_destroy_comp_channel(rd->channel);
+
+	ibv_dealloc_pd(rd->pd);
+
+	return 1;
+}
+
 static int fio_rdma_rw_setup_control_msg_buffers(struct thread_data *td)
 {
 	struct rdma_rw_data *rd = td->io_ops_data;
@@ -400,7 +484,7 @@ static int fio_rdma_rw_setup_connect(struct thread_data *td, const char *host,
 		return 1;
 	}
 
-	err = get_next_channel_event(td, rd->cm_channel, RDMA_CM_EVENT_ADDR_RESOLVED);
+	err = get_next_channel_event(td, rd->cm_channel, RDMA_CM_EVENT_ADDR_RESOLVED, 0);
 	if (err != 0) {
 		log_err("fio: get_next_channel_event: %d\n", err);
 		return 1;
@@ -413,7 +497,7 @@ static int fio_rdma_rw_setup_connect(struct thread_data *td, const char *host,
 		return 1;
 	}
 
-	err = get_next_channel_event(td, rd->cm_channel, RDMA_CM_EVENT_ROUTE_RESOLVED);
+	err = get_next_channel_event(td, rd->cm_channel, RDMA_CM_EVENT_ROUTE_RESOLVED, 0);
 	if (err != 0) {
 		log_err("fio: get_next_channel_event: %d\n", err);
 		return 1;
@@ -469,7 +553,7 @@ static int fio_rdma_rw_setup_listen(struct thread_data *td, short port)
 
 	/* wait for CONNECT_REQUEST */
 	if (get_next_channel_event
-	    (td, rd->cm_channel, RDMA_CM_EVENT_CONNECT_REQUEST) != 0) {
+	    (td, rd->cm_channel, RDMA_CM_EVENT_CONNECT_REQUEST, 0) != 0) {
 		log_err("fio: wait for RDMA_CM_EVENT_CONNECT_REQUEST\n");
 		return 1;
 	}
@@ -490,6 +574,147 @@ static int fio_rdma_rw_setup_listen(struct thread_data *td, short port)
 	return 0;
 }
 
+static int fio_rdma_rw_setup_flush_control_buffers(struct thread_data *td) {
+	struct rdma_rw_data *rd = td->io_ops_data;
+
+	rd->flush_recv_mr = ibv_reg_mr(rd->flush_cm_id->pd, &rd->flush_recv_buf,
+			sizeof(rd->flush_recv_buf), IBV_ACCESS_LOCAL_WRITE);
+	if (rd->flush_recv_mr == NULL) {
+		log_err("fio: flush_recv_mr reg_mr fail: %m\n");
+		return 1;
+	}
+
+	rd->flush_send_mr = ibv_reg_mr(rd->flush_cm_id->pd, &rd->flush_send_buf,
+			sizeof(rd->flush_send_buf), 0);
+	if (rd->flush_send_mr == NULL) {
+		log_err("fio: flush_send_mr reg_mr fail: %m\n");
+		return 1;
+	}
+
+	rd->flush_recv_sgl.addr = (uint64_t) (unsigned long)&rd->flush_recv_buf;
+	rd->recv_sgl.length = sizeof(rd->flush_recv_buf);
+	rd->recv_sgl.lkey = rd->flush_recv_mr->lkey;
+	rd->flush_rq_wr.sg_list = &rd->recv_sgl;
+	rd->flush_rq_wr.num_sge = 1;
+	if (rd->is_client) {
+		rd->rq_wr.wr_id = FLUSH_ACK_WR_ID;
+	} else {
+		rd->rq_wr.wr_id = FLUSH_WR_ID;
+	}
+
+	rd->flush_send_sgl.addr = (uint64_t) (unsigned long)&rd->flush_send_buf;
+	rd->flush_send_sgl.length = sizeof(rd->flush_send_buf);
+	rd->flush_send_sgl.lkey = rd->flush_send_mr->lkey;
+
+	rd->flush_sq_wr.opcode = IBV_WR_SEND;
+	rd->flush_sq_wr.send_flags = IBV_SEND_SIGNALED;
+	rd->flush_sq_wr.sg_list = &rd->send_sgl;
+	rd->flush_sq_wr.num_sge = 1;
+	if (rd->is_client) {
+		rd->flush_sq_wr.wr_id = FLUSH_WR_ID;
+	} else {
+		rd->flush_sq_wr.wr_id = FLUSH_ACK_WR_ID;
+	}
+
+	return 0;
+}
+
+static int fio_rdma_rw_server_setup_flush(struct thread_data *td) {
+	struct rdma_rw_data *rd = td->io_ops_data;
+	struct rdma_rw_options *o = td->eo;
+	int ret;
+	int state = td->runstate;
+	struct sockaddr_in addr;
+
+	td_set_runstate(td, TD_SETTING_UP);
+
+	rd->flush_cm_channel = rdma_create_event_channel();
+	if (!rd->flush_cm_channel) {
+		log_err("fio: rdma_create_event_channel fail: %m\n");
+		return 1;
+	}
+
+	ret = rdma_create_id(rd->flush_cm_channel, &rd->flush_listen_cm_id, rd, RDMA_PS_TCP);
+	if (ret) {
+		log_err("fio: rdma_create_id fail: %m\n");
+		return 1;
+	}
+
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(o->port + 1);
+	addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+	if (rdma_bind_addr(rd->flush_cm_id, (struct sockaddr *)&addr) != 0) {
+		log_err("fio: rdma_bind_addr fail: %m\n");
+		return 1;
+	}
+
+	if (rdma_listen(rd->flush_cm_id, 3) != 0) {
+		log_err("fio: rdma_listen fail: %m\n");
+		return 1;
+	}
+
+	if (get_next_channel_event
+	    (td, rd->cm_channel, RDMA_CM_EVENT_CONNECT_REQUEST, 1) != 0) {
+		log_err("fio: wait for RDMA_CM_EVENT_CONNECT_REQUEST\n");
+		return 1;
+	}
+
+	log_info("fio: flush channel setup successful\n");
+
+	if (fio_rdma_rw_setup_flush_qp(td) != 0)
+		return 1;
+
+	if (fio_rdma_rw_setup_flush_control_buffers(td) != 0)
+		return 1;
+
+	td_set_runstate(td, state);
+	return 0;
+}
+
+static int fio_rdma_rw_client_setup_flush(struct thread_data *td) {
+	struct rdma_rw_data *rd = td->io_ops_data;
+	struct rdma_rw_options *o = td->eo;
+	struct rdma_addrinfo hints, *res;
+	struct ibv_qp_init_attr attr;
+	int ret = 0;
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_port_space = RDMA_PS_TCP;
+	char port_str[8];
+	sprintf(port_str, "%d", o->port + 1);
+	ret = rdma_getaddrinfo(td->o.filename, port_str, &hints, &res);
+	if (ret) {
+		printf("rdma_getaddrinfo failed: %s\n", gai_strerror(ret));
+		return ret;
+	}
+
+	memset(&attr, 0, sizeof(attr));
+	attr.cap.max_send_wr = attr.cap.max_recv_wr = 1;
+	attr.cap.max_send_sge = attr.cap.max_recv_sge = 1;
+	attr.qp_context = &rd->flush_cm_id;
+	attr.sq_sig_all = 1;
+	ret = rdma_create_ep(&rd->flush_cm_id, res, NULL, &attr);
+	if (ret) {
+		perror("rdma_create_ep");
+		goto err1;
+	}
+
+	ret = fio_rdma_rw_setup_flush_control_buffers(td);
+	if (ret) {
+		goto err2;
+	}
+
+	return 0;
+
+err2:
+	rdma_destroy_ep(rd->flush_cm_id);
+err1:
+	rdma_freeaddrinfo(res);
+
+	return 1;
+}
+
 /*
  * The init function is called once per thread/process, and should set up
  * any structures that this io engine requires to keep track of io. Not
@@ -500,8 +725,6 @@ static int fio_rdma_rw_init(struct thread_data *td)
 	struct rdma_rw_data *rd = td->io_ops_data;
 	struct rdma_rw_options *o = td->eo;
 	int ret;
-
-	log_info("flushsize: %d\n", o->flushsize);
 
 	if (td_rw(td)) {
 		log_err("fio: rdma connections must be read OR write\n");
@@ -564,6 +787,17 @@ static int fio_rdma_rw_init(struct thread_data *td)
 		rd->is_client = 1;
 		ret = fio_rdma_rw_setup_connect(td, td->o.filename, o->port);
 	}
+
+	// rmda-rw specific
+	rd->flushsize = o->flushsize;
+	if (!rd->is_client) {
+		rd->flush_buf = fio_memalign(page_size, o->flushsize, 0);
+
+		fio_rdma_rw_server_setup_flush(td);
+	} else {
+		fio_rdma_rw_client_setup_flush(td);
+	}
+
 	return ret;
 }
 
@@ -662,11 +896,11 @@ static int server_recv(struct thread_data *td, struct ibv_wc *wc)
 				ntohl(rd->recv_buf.max_bs), max_bs);
 			return 1;
 		}
-
 	}
 
 	return 0;
 }
+
 
 static int cq_event_handler(struct thread_data *td, enum ibv_wc_opcode opcode)
 {
@@ -676,6 +910,8 @@ static int cq_event_handler(struct thread_data *td, enum ibv_wc_opcode opcode)
 	int ret;
 	int compevnum = 0;
 	int i;
+	struct ibv_send_wr *bad_send_wr;
+	struct ibv_recv_wr *bad_recv_wr;
 
 	while ((ret = ibv_poll_cq(rd->cq, 1, &wc)) == 1) {
 		ret = 0;
@@ -700,33 +936,6 @@ static int cq_event_handler(struct thread_data *td, enum ibv_wc_opcode opcode)
 
 			if (wc.wr_id == FIO_RDMA_MAX_IO_DEPTH)
 				break;
-
-			for (i = 0; i < rd->io_u_flight_nr; i++) {
-				r_io_u_d = rd->io_us_flight[i]->engine_data;
-
-				if (wc.wr_id == r_io_u_d->rq_wr.wr_id) {
-					rd->io_us_flight[i]->resid =
-					    rd->io_us_flight[i]->buflen
-					    - wc.byte_len;
-
-					rd->io_us_flight[i]->error = 0;
-
-					rd->io_us_completed[rd->
-							    io_u_completed_nr]
-					    = rd->io_us_flight[i];
-					rd->io_u_completed_nr++;
-					break;
-				}
-			}
-			if (i == rd->io_u_flight_nr)
-				log_err("fio: recv wr %" PRId64 " not found\n",
-					wc.wr_id);
-			else {
-				/* put the last one into middle of the list */
-				rd->io_us_flight[i] =
-				    rd->io_us_flight[rd->io_u_flight_nr - 1];
-				rd->io_u_flight_nr--;
-			}
 
 			break;
 
@@ -755,6 +964,35 @@ static int cq_event_handler(struct thread_data *td, enum ibv_wc_opcode opcode)
 				rd->io_us_flight[i] =
 				    rd->io_us_flight[rd->io_u_flight_nr - 1];
 				rd->io_u_flight_nr--;
+
+				rd->cached_len += r_io_u_d->sq_wr.sg_list->length;
+				if (rd->cached_len >= rd->flushsize) {
+					if (ibv_post_send(rd->flush_cm_id->qp, &rd->flush_sq_wr, &bad_send_wr) != 0) {
+						log_err("fio: ibv_post_send for flush fail: %m\n");
+						return -1;
+					}
+
+					while (ibv_poll_cq(rd->flush_cm_id->send_cq, 1, &wc) == 0) {
+						continue;
+					}
+					if (wc.wr_id != FLUSH_WR_ID) {
+						log_err("fio: client sends buggy flush wr\n");
+						return -1;
+					}
+
+					// wait for flush ack from the server
+					if (ibv_post_recv(rd->flush_cm_id->qp, &rd->flush_rq_wr, &bad_recv_wr) != 0) {
+						log_err("fio: ibv_post_recv for flush fail: %m\n");
+						return -1;
+					}
+					while (ibv_poll_cq(rd->flush_cm_id->recv_cq, 1, &wc) == 0) {
+						continue;
+					}
+					if (wc.wr_id != FLUSH_ACK_WR_ID) {
+						log_err("fio: server sends buggy flush ack\n");
+						return -1;
+					}
+				}
 			}
 
 			break;
@@ -821,7 +1059,8 @@ static int fio_rdma_rw_accept(struct thread_data *td, struct fio_file *f)
 {
 	struct rdma_rw_data *rd = td->io_ops_data;
 	struct rdma_conn_param conn_param;
-	struct ibv_send_wr *bad_wr;
+	struct ibv_send_wr *bad_sq_wr;
+	struct ibv_recv_wr *bad_cq_wr;
 	int ret = 0;
 
 	/* rdma_accept() - then wait for accept success */
@@ -835,7 +1074,7 @@ static int fio_rdma_rw_accept(struct thread_data *td, struct fio_file *f)
 	}
 
 	if (get_next_channel_event
-	    (td, rd->cm_channel, RDMA_CM_EVENT_ESTABLISHED) != 0) {
+	    (td, rd->cm_channel, RDMA_CM_EVENT_ESTABLISHED, 0) != 0) {
 		log_err("fio: wait for RDMA_CM_EVENT_ESTABLISHED\n");
 		return 1;
 	}
@@ -843,13 +1082,19 @@ static int fio_rdma_rw_accept(struct thread_data *td, struct fio_file *f)
 	/* wait for request */
 	ret = rdma_poll_wait(td, IBV_WC_RECV) < 0;
 
-	if (ibv_post_send(rd->qp, &rd->sq_wr, &bad_wr) != 0) {
+	if (ibv_post_send(rd->qp, &rd->sq_wr, &bad_sq_wr) != 0) {
 		log_err("fio: ibv_post_send fail: %m\n");
 		return 1;
 	}
 
 	if (rdma_poll_wait(td, IBV_WC_SEND) < 0)
 		return 1;
+
+	// post a recv for flush request
+	if (ibv_post_recv(rd->flush_cm_id->qp, &rd->flush_rq_wr, &bad_cq_wr) != 0) {
+		log_err("fio: ibv_post_recv for flush fail: %m\n");
+		return 1;
+	}
 
 	return ret;
 }
@@ -871,7 +1116,7 @@ static int fio_rdma_rw_connect(struct thread_data *td, struct fio_file *f)
 	}
 
 	if (get_next_channel_event
-	    (td, rd->cm_channel, RDMA_CM_EVENT_ESTABLISHED) != 0) {
+	    (td, rd->cm_channel, RDMA_CM_EVENT_ESTABLISHED, 0) != 0) {
 		log_err("fio: wait for RDMA_CM_EVENT_ESTABLISHED\n");
 		return 1;
 	}
@@ -1113,23 +1358,63 @@ static int fio_rdma_rw_send(struct thread_data *td, struct io_u **io_us,
 	return i;
 }
 
+static int flush_buffer(struct thread_data *td) {
+	return 0;
+}
+
 static int fio_rdma_rw_recv(struct thread_data *td, struct io_u **io_us,
 			   unsigned int nr)
 {
 	struct rdma_rw_data *rd = td->io_ops_data;
-	struct ibv_recv_wr *bad_wr;
-	
-	/* re-post the rq_wr */
-	if (ibv_post_recv(rd->qp, &rd->rq_wr, &bad_wr) != 0) {
-		log_err("fio: ibv_post_recv fail: %m\n");
-		return 1;
+	struct ibv_wc wc;
+	struct ibv_send_wr *bad_send_wr;
+	struct ibv_recv_wr *bad_recv_wr;
+	int ret;
+
+	while (1) {
+		ret = rdma_get_recv_comp(rd->flush_cm_id, &wc);
+		if (ret < 0) {
+			log_err("fio: server rdma_get_recv_comp fail: %m\n");
+			goto err;
+		}
+
+		if (rd->flush_recv_buf.opcode == END_WR_ID) {
+			log_info("fio: server receives termination from client\n");
+			break;
+		}
+
+		ret = flush_buffer(td);
+		if (ret) {
+			log_err("fio: server flush_buffer fail: %m\n");
+			goto err;
+		}
+
+		ret = ibv_post_send(rd->flush_cm_id->qp, &rd->flush_sq_wr, &bad_send_wr);
+		if (ret) {
+			log_err("fio: server ibv_post_send fail: %m\n");
+			goto err;
+		}
+
+		ret = rdma_get_send_comp(rd->flush_cm_id, &wc);
+		if (ret < 0) {
+			log_err("fio: server rdma_get_send_comp fail: %m\n");
+			goto err;
+		}
+
+		ret = ibv_post_recv(rd->flush_cm_id->qp, &rd->flush_rq_wr, &bad_recv_wr);
+		if (ret) {
+			log_err("fio: server ibv_post_recv fail: %m\n");
+			goto err;
+		}
 	}
-	
-	rdma_poll_wait(td, IBV_WC_RECV);
 
 	dprint(FD_IO, "fio: recv FINISH message\n");
 	td->done = 1;
 	return 0;
+
+err:
+	td->done = 1;
+	return ret;
 }
 
 static void fio_rdma_rw_queued(struct thread_data *td, struct io_u **io_us,
@@ -1213,6 +1498,7 @@ static int fio_rdma_rw_close_file(struct thread_data *td, struct fio_file *f)
 {
 	struct rdma_rw_data *rd = td->io_ops_data;
 	struct ibv_send_wr *bad_wr;
+	struct ibv_wc wc;
 
 	/* unregister rdma buffer */
 
@@ -1223,13 +1509,14 @@ static int fio_rdma_rw_close_file(struct thread_data *td, struct fio_file *f)
 	if ((rd->is_client == 1) && ((rd->rdma_protocol == FIO_RDMA_RW_READ)
 				     || (rd->rdma_protocol ==
 					 FIO_RDMA_RW_READ))) {
-		if (ibv_post_send(rd->qp, &rd->sq_wr, &bad_wr) != 0) {
+		if (ibv_post_send(rd->flush_cm_id->qp, &rd->flush_sq_wr, &bad_wr) != 0) {
 			log_err("fio: ibv_post_send fail: %m\n");
 			return 1;
 		}
 
 		dprint(FD_IO, "fio: close information sent success\n");
 		rdma_poll_wait(td, IBV_WC_SEND);
+		rdma_get_send_comp(rd->flush_cm_id, &wc);
 	}
 
 	if (rd->is_client == 1)

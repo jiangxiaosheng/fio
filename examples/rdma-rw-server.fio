@@ -5,6 +5,9 @@ port=9876
 bs=2k
 size=10g
 flushsize=2m
+filename=/mnt/test
+thread
+cpus_allowed_policy=split
 
 [receiver]
 rw=read
