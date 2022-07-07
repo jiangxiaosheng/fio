@@ -1639,7 +1639,7 @@ static void *thread_main(void *data)
 	dprint(FD_MUTEX, "up startup_sem\n");
 	fio_sem_up(startup_sem);
 	dprint(FD_MUTEX, "wait on td->sem\n");
-	// fio_sem_down(td->sem);
+	fio_sem_down(td->sem);
 	dprint(FD_MUTEX, "done waiting on td->sem\n");
 
 	/*
@@ -2454,7 +2454,7 @@ reap:
 				fd = NULL;
 			}
 			dprint(FD_MUTEX, "wait on startup_sem\n");
-			sleep(1000000);
+			// sleep(1000000);
 			if (fio_sem_down_timeout(startup_sem, 10000)) {
 				log_err("fio: job startup hung? exiting.\n");
 				fio_terminate_threads(TERMINATE_ALL, TERMINATE_ALL);
