@@ -1,10 +1,11 @@
 # Example rdma server job
 [global]
 ioengine=external:/users/sjiang/nvmeof-project/fio/engines/rdma_rw.o
+;ioengine=rdma
 port=9876
-bs=2k
+bs=64k
 size=10g
-flushsize=2m
+flushsize=8m
 filename=/mnt/test
 thread
 cpus_allowed_policy=split

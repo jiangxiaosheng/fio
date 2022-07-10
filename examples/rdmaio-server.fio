@@ -1,9 +1,16 @@
 # Example rdma server job
 [global]
 ioengine=rdma
-port=[port]
-bs=1m
-size=100g
+port=9876
+bs=64k
+size=10g
+thread
+cpus_allowed_policy=split
+
+gtod_reduce=0
+group_reporting
+time_based
+runtime=20
 
 [receiver]
 rw=read
