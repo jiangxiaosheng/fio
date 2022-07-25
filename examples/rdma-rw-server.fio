@@ -5,7 +5,7 @@ ioengine=external:/users/sjiang/nvmeof-project/fio/engines/rdma_rw.o
 port=9876
 bs=64k
 size=10g
-flushsize=8m
+flushsize=16m
 filename=/mnt/test
 thread
 cpus_allowed_policy=split

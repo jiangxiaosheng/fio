@@ -74,6 +74,7 @@ enum opt_category_group {
 	__FIO_OPT_G_WINDOWSAIO,
 	__FIO_OPT_G_XNVME,
 	__FIO_OPT_G_RDMA_RW,
+	__FIO_OPT_G_RDMA_IORING,
 
 	FIO_OPT_G_RATE		= (1ULL << __FIO_OPT_G_RATE),
 	FIO_OPT_G_ZONE		= (1ULL << __FIO_OPT_G_ZONE),
@@ -122,6 +123,7 @@ enum opt_category_group {
 	FIO_OPT_G_WINDOWSAIO	= (1ULL << __FIO_OPT_G_WINDOWSAIO),
 	FIO_OPT_G_XNVME         = (1ULL << __FIO_OPT_G_XNVME),
 	FIO_OPT_G_RDMA_RW	= (1ULL << __FIO_OPT_G_RDMA_RW),
+	FIO_OPT_G_RDMA_IORING	= (1ULL << __FIO_OPT_G_RDMA_IORING),
 };
 
 extern const struct opt_group *opt_group_from_mask(uint64_t *mask);

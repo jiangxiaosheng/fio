@@ -2,16 +2,10 @@
 [global]
 ioengine=rdma
 port=9876
-bs=64k
-size=10g
+bs=4k
+size=100g
 thread
-cpus_allowed_policy=split
-
-gtod_reduce=0
-group_reporting
-time_based
-runtime=20
 
 [receiver]
 rw=read
-iodepth=16
+iodepth=128
