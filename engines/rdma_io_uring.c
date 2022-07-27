@@ -243,6 +243,9 @@ struct rdma_ioring_data {
 
 	unsigned int ioring_iodepth;
 	struct io_uring ring;
+
+	// for debug purpose
+	unsigned long req_nr;
 };
 
 static int client_recv(struct thread_data *td, struct ibv_wc *wc)
@@ -312,14 +315,45 @@ static int server_recv(struct thread_data *td, struct ibv_wc *wc)
 	return 0;
 }
 
-static enum fio_q_status ioring_queue(struct thread_data *td)
+static enum fio_q_status ioring_queue(struct thread_data *td, void *buf, uint32_t len)
 {
+	struct rdma_ioring_data *rd = td->io_ops_data;
+	struct io_uring_sqe *sqe;
+	int ret;
 
+	log_info("buf: %p, len: %u\n", buf, len);
+	
+	sqe = io_uring_get_sqe(&rd->ring);
+	if (!sqe)
+		return FIO_Q_BUSY;
+	
+	io_uring_prep_write(sqe, rd->backend_log_fd, buf, len, 0);
+	ret = io_uring_submit(&rd->ring);
+	if (ret != 1) {
+		log_err("fio: io_uring_submit: %m\n");
+		return FIO_Q_BUSY;
+	}
+
+	return FIO_Q_QUEUED;
 }
 
 static int ioring_reap_cq(struct thread_data *td)
 {
+	unsigned head;
+	struct io_uring_cqe *cqe;
+	struct rdma_ioring_data *rd = td->io_ops_data;
 
+	io_uring_for_each_cqe(&rd->ring, head, cqe) {
+		if (cqe->res < 0) {
+			log_err("fio: io_uring cqe error: %s\n", strerror(-cqe->res));
+			return -1;
+		}
+		io_uring_cqe_seen(&rd->ring, cqe);
+		rd->req_nr++;
+	}
+	log_info("fio: completed io requests: %lu\n", rd->req_nr);
+
+	return 0;
 }
 
 static int cq_event_handler(struct thread_data *td, enum ibv_wc_opcode opcode)
@@ -331,14 +365,22 @@ static int cq_event_handler(struct thread_data *td, enum ibv_wc_opcode opcode)
 	int compevnum = 0;
 	int i;
 	enum fio_q_status sq_status;
+	void *ioring_buf;
+
+	if (!rd->is_client) {
+		ret = ioring_reap_cq(td);
+		if (ret < 0) {
+			return -1;
+		}
+	}
 
 	while ((ret = ibv_poll_cq(rd->cq, 1, &wc)) == 1) {
 		ret = 0;
 		compevnum++;
 
 		if (wc.status) {
-			log_err("fio: cq completion status %d(%s)\n",
-				wc.status, ibv_wc_status_str(wc.status));
+			log_err("fio: cq completion status %d(%s), req nr: %lu\n",
+				wc.status, ibv_wc_status_str(wc.status), rd->req_nr);
 			return -1;
 		}
 
@@ -359,6 +401,8 @@ static int cq_event_handler(struct thread_data *td, enum ibv_wc_opcode opcode)
 			for (i = 0; i < rd->io_u_flight_nr; i++) {
 				r_io_u_d = rd->io_us_flight[i]->engine_data;
 
+				ioring_buf = rd->io_us_flight[i]->buf;
+
 				if (wc.wr_id == r_io_u_d->rq_wr.wr_id) {
 					rd->io_us_flight[i]->resid =
 					    rd->io_us_flight[i]->buflen
@@ -371,9 +415,6 @@ static int cq_event_handler(struct thread_data *td, enum ibv_wc_opcode opcode)
 					    = rd->io_us_flight[i];
 					rd->io_u_completed_nr++;
 
-					sq_status = ioring_queue(td);
-
-
 					break;
 				}
 			}
@@ -385,6 +426,16 @@ static int cq_event_handler(struct thread_data *td, enum ibv_wc_opcode opcode)
 				rd->io_us_flight[i] =
 				    rd->io_us_flight[rd->io_u_flight_nr - 1];
 				rd->io_u_flight_nr--;
+
+			retry:
+				sq_status = ioring_queue(td, ioring_buf, wc.byte_len);
+				if (sq_status == FIO_Q_BUSY) {
+					ret = ioring_reap_cq(td);
+					if (ret < 0) {
+						return -1;
+					}
+					goto retry;
+				}
 			}
 
 			break;
@@ -425,8 +476,6 @@ static int cq_event_handler(struct thread_data *td, enum ibv_wc_opcode opcode)
 		}
 		rd->cq_event_num++;
 	}
-
-	// poll io_uring cqe
 
 	if (ret) {
 		log_err("fio: poll error %d\n", ret);
@@ -919,6 +968,9 @@ static int fio_rdma_ioring_commit(struct thread_data *td)
 			ret = 0;	/* must be a SYNC */
 
 		if (ret > 0) {
+			if (rd->is_client)
+				rd->req_nr += ret;
+
 			fio_rdma_ioring_queued(td, io_us, ret);
 			io_u_mark_submit(td, ret);
 			rd->io_u_queued_nr -= ret;
@@ -977,7 +1029,7 @@ static int fio_rdma_ioring_connect(struct thread_data *td, struct fio_file *f)
 	 * This may lead to RNR error. Here, SEND side pauses for a while
 	 * during which RECV side commits sufficient recv buffers.
 	 */
-	usleep(1000000);
+	usleep(2000000);
 
 	return 0;
 }
@@ -1075,17 +1127,7 @@ static int fio_rdma_ioring_close_file(struct thread_data *td, struct fio_file *f
 		rdma_disconnect(rd->cm_id);
 	else {
 		rdma_disconnect(rd->child_cm_id);
-#if 0
-		rdma_disconnect(rd->cm_id);
-#endif
 	}
-
-#if 0
-	if (get_next_channel_event(td, rd->cm_channel, RDMA_CM_EVENT_DISCONNECTED) != 0) {
-		log_err("fio: wait for RDMA_CM_EVENT_DISCONNECTED\n");
-		return 1;
-	}
-#endif
 
 	ibv_destroy_cq(rd->cq);
 	ibv_destroy_qp(rd->qp);
@@ -1376,6 +1418,8 @@ static int fio_rdma_ioring_post_init(struct thread_data *td)
 static void fio_rdma_ioring_cleanup(struct thread_data *td)
 {
 	struct rdma_ioring_data *rd = td->io_ops_data;
+
+	log_info("fio: committed %lu io requests\n", rd->req_nr);
 
 	if (rd)
 		free(rd);

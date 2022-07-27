@@ -5,6 +5,7 @@ port=9876
 bs=4k
 size=100g
 thread
+direct=1
 
 filename=/mnt/test
 
@@ -12,3 +13,4 @@ filename=/mnt/test
 rw=read
 ioring_iodepth=256
 iodepth=256
+;iodepth_batch=0

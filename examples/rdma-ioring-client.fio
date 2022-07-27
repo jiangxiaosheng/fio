@@ -11,5 +11,5 @@ runtime=10
 
 [sender]
 rw=write
-iodepth=32
+iodepth=1
 iodepth_batch_complete=1
