@@ -1,7 +1,7 @@
 # Example rdma client job
 [global]
 ioengine=external:/users/sjiang/nvmeof-project/fio/engines/rdma_io_uring.o
-hostname=10.10.1.1
+hostname=10.10.1.2
 port=9876
 verb=send
 bs=4k
@@ -11,5 +11,5 @@ runtime=10
 
 [sender]
 rw=write
-iodepth=1
+iodepth=64
 iodepth_batch_complete=1
