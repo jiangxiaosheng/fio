@@ -73,6 +73,7 @@ struct rdma_ioring_options {
 	unsigned int registerfiles;
 	unsigned int sqpoll_thread;
 	unsigned int ioring_iodepth;
+	char *ioring_filename;
 };
 
 static int str_hostname_cb(void *data, const char *input)
@@ -164,6 +165,14 @@ static struct fio_option options[] = {
 	// 	.group	= FIO_OPT_G_RDMA_IORING,
 	// },
 	{
+		.name	= "ioring_filename",
+		.lname	= "filename for io_uring read/write",
+		.type	= FIO_OPT_STR_STORE,
+		.off1	= offsetof(struct rdma_ioring_options, ioring_filename),
+		.category	= FIO_OPT_C_ENGINE,
+		.group 	= FIO_OPT_G_RDMA_IORING,
+	},
+	{
 		.name	= "ioring_iodepth",
 		.lname	= "iodepth for io_uring",
 		.type = FIO_OPT_INT,
@@ -240,9 +249,12 @@ struct rdma_ioring_data {
 
 	int backend_log_fd;
 	unsigned int backend_log_size;
+	size_t log_pos;
 
 	unsigned int ioring_iodepth;
+	char *ioring_filename;
 	struct io_uring ring;
+	uint64_t ioring_duration;
 
 	// for debug purpose
 	unsigned long req_nr;
@@ -321,18 +333,21 @@ static enum fio_q_status ioring_queue(struct thread_data *td, void *buf, uint32_
 	struct io_uring_sqe *sqe;
 	int ret;
 
-	log_info("buf: %p, len: %u\n", buf, len);
+	// log_info("buf addr: %p, len: %u\n", buf, len);
 	
 	sqe = io_uring_get_sqe(&rd->ring);
 	if (!sqe)
 		return FIO_Q_BUSY;
 	
-	io_uring_prep_write(sqe, rd->backend_log_fd, buf, len, 0);
+	io_uring_prep_write(sqe, rd->backend_log_fd, buf, len, rd->log_pos);
 	ret = io_uring_submit(&rd->ring);
 	if (ret != 1) {
 		log_err("fio: io_uring_submit: %m\n");
 		return FIO_Q_BUSY;
 	}
+	if (rd->log_pos >= rd->backend_log_size)
+		rd->log_pos = 0;
+	rd->log_pos += len;
 
 	return FIO_Q_QUEUED;
 }
@@ -351,7 +366,7 @@ static int ioring_reap_cq(struct thread_data *td)
 		io_uring_cqe_seen(&rd->ring, cqe);
 		rd->req_nr++;
 	}
-	log_info("fio: completed io requests: %lu\n", rd->req_nr);
+	// log_info("fio: completed io requests: %lu\n", rd->req_nr);
 
 	return 0;
 }
@@ -364,15 +379,20 @@ static int cq_event_handler(struct thread_data *td, enum ibv_wc_opcode opcode)
 	int ret;
 	int compevnum = 0;
 	int i;
-	enum fio_q_status sq_status;
-	void *ioring_buf;
+	struct timespec ts_start, ts_end;
 
-	if (!rd->is_client) {
+
+	clock_gettime(CLOCK_REALTIME, &ts_start);
+
+	if (rd->is_client) {
 		ret = ioring_reap_cq(td);
 		if (ret < 0) {
 			return -1;
 		}
 	}
+
+	clock_gettime(CLOCK_REALTIME, &ts_end);
+	rd->ioring_duration += (ts_end.tv_sec - ts_start.tv_sec) * 1000000000 + (ts_end.tv_nsec - ts_start.tv_nsec);
 
 	while ((ret = ibv_poll_cq(rd->cq, 1, &wc)) == 1) {
 		ret = 0;
@@ -401,8 +421,6 @@ static int cq_event_handler(struct thread_data *td, enum ibv_wc_opcode opcode)
 			for (i = 0; i < rd->io_u_flight_nr; i++) {
 				r_io_u_d = rd->io_us_flight[i]->engine_data;
 
-				ioring_buf = rd->io_us_flight[i]->buf;
-
 				if (wc.wr_id == r_io_u_d->rq_wr.wr_id) {
 					rd->io_us_flight[i]->resid =
 					    rd->io_us_flight[i]->buflen
@@ -426,16 +444,6 @@ static int cq_event_handler(struct thread_data *td, enum ibv_wc_opcode opcode)
 				rd->io_us_flight[i] =
 				    rd->io_us_flight[rd->io_u_flight_nr - 1];
 				rd->io_u_flight_nr--;
-
-			retry:
-				sq_status = ioring_queue(td, ioring_buf, wc.byte_len);
-				if (sq_status == FIO_Q_BUSY) {
-					ret = ioring_reap_cq(td);
-					if (ret < 0) {
-						return -1;
-					}
-					goto retry;
-				}
 			}
 
 			break;
@@ -465,6 +473,18 @@ static int cq_event_handler(struct thread_data *td, enum ibv_wc_opcode opcode)
 				rd->io_us_flight[i] =
 				    rd->io_us_flight[rd->io_u_flight_nr - 1];
 				rd->io_u_flight_nr--;
+
+				if (rd->is_client) {
+				retry:
+					// log_info("buf addr: %lu, len: %u\n", r_io_u_d->rdma_sgl.addr, r_io_u_d->rdma_sgl.length);
+					if (ioring_queue(td, (void *) r_io_u_d->rdma_sgl.addr, r_io_u_d->rdma_sgl.length) == FIO_Q_BUSY) {
+						if (ioring_reap_cq(td)) {
+							log_err("fio: reap rdma cq failed: %m\n");
+							return -1;
+						}
+						goto retry;
+					}
+				}
 			}
 
 			break;
@@ -992,7 +1012,8 @@ static int fio_rdma_ioring_connect(struct thread_data *td, struct fio_file *f)
 	memset(&conn_param, 0, sizeof(conn_param));
 	conn_param.responder_resources = 1;
 	conn_param.initiator_depth = 1;
-	conn_param.retry_count = 10;
+	conn_param.retry_count = 7;
+	conn_param.rnr_retry_count = 7;
 
 	if (rdma_connect(rd->cm_id, &conn_param) != 0) {
 		log_err("fio: rdma_connect fail: %m\n");
@@ -1029,7 +1050,7 @@ static int fio_rdma_ioring_connect(struct thread_data *td, struct fio_file *f)
 	 * This may lead to RNR error. Here, SEND side pauses for a while
 	 * during which RECV side commits sufficient recv buffers.
 	 */
-	usleep(2000000);
+	usleep(500000);
 
 	return 0;
 }
@@ -1045,6 +1066,8 @@ static int fio_rdma_ioring_accept(struct thread_data *td, struct fio_file *f)
 	memset(&conn_param, 0, sizeof(conn_param));
 	conn_param.responder_resources = 1;
 	conn_param.initiator_depth = 1;
+	conn_param.retry_count = 7;
+	conn_param.rnr_retry_count = 7;
 
 	if (rdma_accept(rd->child_cm_id, &conn_param) != 0) {
 		log_err("fio: rdma_accept: %m\n");
@@ -1074,9 +1097,8 @@ static int fio_rdma_ioring_accept(struct thread_data *td, struct fio_file *f)
 static int open_backend_log(struct thread_data *td) {
 	struct rdma_ioring_data *rd = td->io_ops_data;
 	struct stat st;
-	char *filename = td->o.filename;
 
-	rd->backend_log_fd = open(filename, O_WRONLY | O_DIRECT);
+	rd->backend_log_fd = open(rd->ioring_filename, O_WRONLY | O_DIRECT);
 	if (rd->backend_log_fd < 0) {
 		log_err("fio: open fail: %m\n");
 		return -1;
@@ -1308,9 +1330,10 @@ static int fio_rdma_ioring_init(struct thread_data *td)
 		return 1;
 	}
 
-	// only server needs to init io_uring stuff
-	if (td_read(td)) {
+	// only client needs to init io_uring stuff
+	if (td_write(td)) {
 		rd->ioring_iodepth = roundup_pow2(o->ioring_iodepth);
+		rd->ioring_filename = o->ioring_filename;
 
 		memset(&p, 0, sizeof(p));
 

@@ -1,8 +1,9 @@
 # Example rdma server job
 [global]
 ioengine=rdma
+
 port=9876
-bs=4k
+bs=16k
 size=100g
 thread
 
