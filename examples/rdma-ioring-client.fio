@@ -15,7 +15,9 @@ thread
 rw=write
 iodepth=128
 iodepth_batch_complete=0
-iodepth_batch=1
-ioring_iodepth=128
 direct=1
+
+; engine-specific
+ioring_iodepth=128
 ioring_filename=/mnt/test
+ioring_submit_batch=1

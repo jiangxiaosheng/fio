@@ -74,6 +74,7 @@ struct rdma_ioring_options {
 	unsigned int sqpoll_thread;
 	unsigned int ioring_iodepth;
 	char *ioring_filename;
+	int ioring_submit_batch;
 };
 
 static int str_hostname_cb(void *data, const char *input)
@@ -182,6 +183,15 @@ static struct fio_option options[] = {
 		.group	= FIO_OPT_G_RDMA_IORING,
 	},
 	{
+		.name	= "ioring_submit_batch",
+		.lname	= "ioring_submit_batch",
+		.type	= FIO_OPT_INT,
+		.off1	= offsetof(struct rdma_ioring_options, ioring_submit_batch),
+		.help	= "batch submission for io_uring",
+		.category	= FIO_OPT_C_ENGINE,
+		.group	= FIO_OPT_G_RDMA_IORING,
+	},
+	{
 		.name	= NULL,
 	},
 };
@@ -254,7 +264,8 @@ struct rdma_ioring_data {
 	unsigned int ioring_iodepth;
 	char *ioring_filename;
 	struct io_uring ring;
-	uint64_t ioring_duration;
+	int ioring_cur_sqes;
+	int ioring_submit_batch;
 
 	// for debug purpose
 	unsigned long req_nr;
@@ -327,29 +338,24 @@ static int server_recv(struct thread_data *td, struct ibv_wc *wc)
 	return 0;
 }
 
-static enum fio_q_status ioring_queue(struct thread_data *td, void *buf, uint32_t len)
+static struct io_uring_sqe *ioring_get_sqe(struct thread_data *td, void *buf, uint32_t len)
 {
 	struct rdma_ioring_data *rd = td->io_ops_data;
 	struct io_uring_sqe *sqe;
-	int ret;
 
 	// log_info("buf addr: %p, len: %u\n", buf, len);
 	
 	sqe = io_uring_get_sqe(&rd->ring);
 	if (!sqe)
-		return FIO_Q_BUSY;
+		return NULL;
 	
 	io_uring_prep_write(sqe, rd->backend_log_fd, buf, len, rd->log_pos);
-	ret = io_uring_submit(&rd->ring);
-	if (ret != 1) {
-		log_err("fio: io_uring_submit: %m\n");
-		return FIO_Q_BUSY;
-	}
+
+	rd->log_pos += len;
 	if (rd->log_pos >= rd->backend_log_size)
 		rd->log_pos = 0;
-	rd->log_pos += len;
 
-	return FIO_Q_QUEUED;
+	return sqe;
 }
 
 static int ioring_reap_cq(struct thread_data *td)
@@ -379,20 +385,6 @@ static int cq_event_handler(struct thread_data *td, enum ibv_wc_opcode opcode)
 	int ret;
 	int compevnum = 0;
 	int i;
-	struct timespec ts_start, ts_end;
-
-
-	clock_gettime(CLOCK_REALTIME, &ts_start);
-
-	if (rd->is_client) {
-		ret = ioring_reap_cq(td);
-		if (ret < 0) {
-			return -1;
-		}
-	}
-
-	clock_gettime(CLOCK_REALTIME, &ts_end);
-	rd->ioring_duration += (ts_end.tv_sec - ts_start.tv_sec) * 1000000000 + (ts_end.tv_nsec - ts_start.tv_nsec);
 
 	while ((ret = ibv_poll_cq(rd->cq, 1, &wc)) == 1) {
 		ret = 0;
@@ -475,14 +467,24 @@ static int cq_event_handler(struct thread_data *td, enum ibv_wc_opcode opcode)
 				rd->io_u_flight_nr--;
 
 				if (rd->is_client) {
-				retry:
-					// log_info("buf addr: %lu, len: %u\n", r_io_u_d->rdma_sgl.addr, r_io_u_d->rdma_sgl.length);
-					if (ioring_queue(td, (void *) r_io_u_d->rdma_sgl.addr, r_io_u_d->rdma_sgl.length) == FIO_Q_BUSY) {
-						if (ioring_reap_cq(td)) {
-							log_err("fio: reap rdma cq failed: %m\n");
+					struct io_uring_sqe *sqe;
+					if (ioring_reap_cq(td)) {
+						log_err("reap cq error: %m\n");
+						return -1;
+					}
+					while (true) {
+						sqe = ioring_get_sqe(td, (void *) r_io_u_d->rdma_sgl.addr, r_io_u_d->rdma_sgl.length);
+						if (sqe != NULL)
+							break;
+					}
+					rd->ioring_cur_sqes++;
+					if (rd->ioring_cur_sqes == rd->ioring_submit_batch) {
+						ret = io_uring_submit(&rd->ring);
+						if (ret != rd->ioring_submit_batch) {
+							log_err("io_uring submit error: ret = %d, %m\n", ret);
 							return -1;
 						}
-						goto retry;
+						rd->ioring_cur_sqes = 0;
 					}
 				}
 			}
@@ -1334,6 +1336,8 @@ static int fio_rdma_ioring_init(struct thread_data *td)
 	if (td_write(td)) {
 		rd->ioring_iodepth = roundup_pow2(o->ioring_iodepth);
 		rd->ioring_filename = o->ioring_filename;
+		rd->ioring_cur_sqes = 0;
+		rd->ioring_submit_batch = o->ioring_submit_batch;
 
 		memset(&p, 0, sizeof(p));
 
