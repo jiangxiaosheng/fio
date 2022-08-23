@@ -269,6 +269,9 @@ struct rdma_ioring_data {
 
 	// for debug purpose
 	unsigned long req_nr;
+
+	unsigned long completed_rdma;
+	unsigned long completed_ioring;
 };
 
 static int client_recv(struct thread_data *td, struct ibv_wc *wc)
@@ -371,6 +374,7 @@ static int ioring_reap_cq(struct thread_data *td)
 		}
 		io_uring_cqe_seen(&rd->ring, cqe);
 		rd->req_nr++;
+		rd->completed_ioring++;
 	}
 	// log_info("fio: completed io requests: %lu\n", rd->req_nr);
 
@@ -467,6 +471,7 @@ static int cq_event_handler(struct thread_data *td, enum ibv_wc_opcode opcode)
 				rd->io_u_flight_nr--;
 
 				if (rd->is_client) {
+					rd->completed_rdma++;
 					struct io_uring_sqe *sqe;
 					if (ioring_reap_cq(td)) {
 						log_err("reap cq error: %m\n");
@@ -479,7 +484,7 @@ static int cq_event_handler(struct thread_data *td, enum ibv_wc_opcode opcode)
 					}
 					rd->ioring_cur_sqes++;
 					if (rd->ioring_cur_sqes == rd->ioring_submit_batch) {
-						ret = io_uring_submit(&rd->ring);
+						ret = io_uring_submit_and_wait(&rd->ring, rd->ioring_submit_batch);
 						if (ret != rd->ioring_submit_batch) {
 							log_err("io_uring submit error: ret = %d, %m\n", ret);
 							return -1;
@@ -1145,6 +1150,15 @@ static int fio_rdma_ioring_close_file(struct thread_data *td, struct fio_file *f
 
 		dprint(FD_IO, "fio: close information sent success\n");
 		rdma_poll_wait(td, IBV_WC_SEND);
+
+		// while (rd->completed_ioring < rd->completed_rdma - rd->ioring_submit_batch) {
+		// 	if (ioring_reap_cq(td)) {
+		// 		log_err("fio: reap cq fail\n");
+		// 		return 1;
+		// 	}
+		// 	log_info("completed iouring: %ld, completed rdma: %ld\n", 
+		// 		rd->completed_ioring, rd->completed_rdma);
+		// }
 	}
 
 	if (rd->is_client == 1)
@@ -1196,7 +1210,7 @@ static int fio_rdma_ioring_setup_connect(struct thread_data *td, const char *hos
 	int err;
 
 	rd->addr.sin_family = AF_INET;
-	rd->addr.sin_port = htons(port);
+	rd->addr.sin_port = htons(port + td->thread_number - 1);
 
 	err = aton(td, host, &rd->addr);
 	if (err)
@@ -1267,12 +1281,19 @@ static int fio_rdma_ioring_setup_listen(struct thread_data *td, short port)
 	td_set_runstate(td, TD_SETTING_UP);
 
 	rd->addr.sin_family = AF_INET;
-	rd->addr.sin_port = htons(port);
+	rd->addr.sin_port = htons(port + td->thread_number - 1);
 
 	if (!o->bindname || !strlen(o->bindname))
 		rd->addr.sin_addr.s_addr = htonl(INADDR_ANY);
 	else
 		rd->addr.sin_addr.s_addr = htonl(*o->bindname);
+
+	// int val = 1;
+	// if (rdma_set_option(rd->cm_id, RDMA_OPTION_ID, RDMA_OPTION_ID_REUSEADDR, 
+	// 	&val, sizeof(val))) {
+	// 	log_err("fio: rdma_set_option fail: %m\n");
+	// 	return 1;
+	// }
 
 	/* rdma_listen */
 	if (rdma_bind_addr(rd->cm_id, (struct sockaddr *)&rd->addr) != 0) {
@@ -1445,8 +1466,6 @@ static int fio_rdma_ioring_post_init(struct thread_data *td)
 static void fio_rdma_ioring_cleanup(struct thread_data *td)
 {
 	struct rdma_ioring_data *rd = td->io_ops_data;
-
-	log_info("fio: committed %lu io requests\n", rd->req_nr);
 
 	if (rd)
 		free(rd);

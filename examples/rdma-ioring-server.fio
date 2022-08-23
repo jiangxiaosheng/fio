@@ -7,6 +7,9 @@ port=9876
 bs=16k
 size=100g
 thread
+cpus_allowed_policy=split
+cpus_allowed=0-15
+numjobs=3
 
 [receiver]
 rw=read

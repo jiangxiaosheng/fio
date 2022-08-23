@@ -5,12 +5,14 @@ ioengine=net
 port=8888
 #Use =udp for UDP, =unix for local unix domain socket
 protocol=tcp
-bs=512k
+bs=16k
 size=100g
 #set the below option to enable end-to-end data integrity tests
 #verify=md5
 thread
 cpus_allowed_policy=split
+cpus_allowed=0-15
+numjobs=2
 
 [receiver]
 listen
