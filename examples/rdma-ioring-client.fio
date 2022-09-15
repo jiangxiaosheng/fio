@@ -5,23 +5,23 @@ ioengine=external:/users/sjiang/nvmeof-project/fio/engines/rdma_io_uring.o
 hostname=10.10.1.2
 port=9876
 verb=write
-bs=16k
+bs=4k
 size=100g
 time_based
-runtime=10
+runtime=15
 group_reporting
 thread
 cpus_allowed_policy=split
 cpus_allowed=0-15
-numjobs=2
+numjobs=1
 
 [sender]
 rw=write
 iodepth=128
-iodepth_batch_complete=0
+#iodepth_batch_complete=0
 direct=1
 
 ; engine-specific
 ioring_iodepth=128
 ioring_filename=/mnt/test
-ioring_submit_batch=128
+ioring_submit_batch=16

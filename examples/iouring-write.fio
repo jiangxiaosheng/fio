@@ -10,14 +10,14 @@ cpus_allowed_policy=split
 thread
 group_reporting
 time_based
-runtime=10
+runtime=60
 
 ; controllable variables
-bs=16k
+bs=4k
 iodepth=128
 cpus_allowed=0-15
 numjobs=1
 
 ; Remote device
 [device]
-filename=/mnt/test
+filename=/nvme/test

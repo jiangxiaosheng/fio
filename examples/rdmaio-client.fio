@@ -2,16 +2,16 @@
 [global]
 ioengine=rdma
 
-hostname=10.10.1.1
+hostname=10.10.1.2
 port=9876
 verb=write
-bs=16k
+bs=4k
 size=100g
 time_based
 runtime=10
 
 [sender]
 rw=write
-iodepth=64
-iodepth_batch=1
-iodepth_batch_complete=0
+iodepth=128
+#iodepth_batch=1
+#iodepth_batch_complete=0

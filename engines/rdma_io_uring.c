@@ -345,11 +345,9 @@ static struct io_uring_sqe *ioring_get_sqe(struct thread_data *td, void *buf, ui
 {
 	struct rdma_ioring_data *rd = td->io_ops_data;
 	struct io_uring_sqe *sqe;
-
-	// log_info("buf addr: %p, len: %u\n", buf, len);
 	
 	sqe = io_uring_get_sqe(&rd->ring);
-	if (!sqe)
+	if (sqe == NULL)
 		return NULL;
 	
 	io_uring_prep_write(sqe, rd->backend_log_fd, buf, len, rd->log_pos);
@@ -361,24 +359,32 @@ static struct io_uring_sqe *ioring_get_sqe(struct thread_data *td, void *buf, ui
 	return sqe;
 }
 
-static int ioring_reap_cq(struct thread_data *td)
+static int ioring_reap_cq(struct thread_data *td, int events, int max)
 {
 	unsigned head;
 	struct io_uring_cqe *cqe;
 	struct rdma_ioring_data *rd = td->io_ops_data;
+	unsigned reaped = 0;
+	int exit;
 
-	io_uring_for_each_cqe(&rd->ring, head, cqe) {
-		if (cqe->res < 0) {
-			log_err("fio: io_uring cqe error: %s\n", strerror(-cqe->res));
-			return -1;
+	do {
+		exit = 1;
+		io_uring_for_each_cqe(&rd->ring, head, cqe) {
+			if (cqe->res < 0) {
+				log_err("fio: io_uring cqe error: %s\n", strerror(-cqe->res));
+				return -1;
+			}
+			io_uring_cqe_seen(&rd->ring, cqe);
+			reaped++;
+			rd->completed_ioring++;
+			exit = 0;
 		}
-		io_uring_cqe_seen(&rd->ring, cqe);
-		rd->req_nr++;
-		rd->completed_ioring++;
-	}
-	// log_info("fio: completed io requests: %lu\n", rd->req_nr);
+		if (exit) {
+			break;
+		}
+	} while (events + reaped < max);
 
-	return 0;
+	return reaped;
 }
 
 static int cq_event_handler(struct thread_data *td, enum ibv_wc_opcode opcode)
@@ -470,26 +476,38 @@ static int cq_event_handler(struct thread_data *td, enum ibv_wc_opcode opcode)
 				    rd->io_us_flight[rd->io_u_flight_nr - 1];
 				rd->io_u_flight_nr--;
 
+				rd->completed_rdma++;
+
 				if (rd->is_client) {
-					rd->completed_rdma++;
 					struct io_uring_sqe *sqe;
-					if (ioring_reap_cq(td)) {
-						log_err("reap cq error: %m\n");
-						return -1;
-					}
+					int events = 0, max = 1, min = 1;
+					int r;
+					
 					while (true) {
 						sqe = ioring_get_sqe(td, (void *) r_io_u_d->rdma_sgl.addr, r_io_u_d->rdma_sgl.length);
 						if (sqe != NULL)
 							break;
+						/* means sq is busy */
+						do {
+							r = ioring_reap_cq(td, events, max);
+							events += r;
+							log_info("im busy\n");
+						} while (events < min);
 					}
+
 					rd->ioring_cur_sqes++;
 					if (rd->ioring_cur_sqes == rd->ioring_submit_batch) {
-						ret = io_uring_submit_and_wait(&rd->ring, rd->ioring_submit_batch);
-						if (ret != rd->ioring_submit_batch) {
-							log_err("io_uring submit error: ret = %d, %m\n", ret);
-							return -1;
+						while (rd->ioring_cur_sqes != 0) {
+							ret = io_uring_submit(&rd->ring);
+							if (ret > 0) {
+								rd->ioring_cur_sqes -= ret;
+								// log_info("submit %d sqes\n", ret);
+							} else {
+								/* should reap the cq here */
+								log_err("io_uring submit returns %d\n", ret);
+								return -1;
+							}
 						}
-						rd->ioring_cur_sqes = 0;
 					}
 				}
 			}
@@ -1151,14 +1169,7 @@ static int fio_rdma_ioring_close_file(struct thread_data *td, struct fio_file *f
 		dprint(FD_IO, "fio: close information sent success\n");
 		rdma_poll_wait(td, IBV_WC_SEND);
 
-		// while (rd->completed_ioring < rd->completed_rdma - rd->ioring_submit_batch) {
-		// 	if (ioring_reap_cq(td)) {
-		// 		log_err("fio: reap cq fail\n");
-		// 		return 1;
-		// 	}
-		// 	log_info("completed iouring: %ld, completed rdma: %ld\n", 
-		// 		rd->completed_ioring, rd->completed_rdma);
-		// }
+		log_info("\ncompleted rdma: %lu, completed io_uring: %lu\n", rd->completed_rdma, rd->completed_ioring);
 	}
 
 	if (rd->is_client == 1)
