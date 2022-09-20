@@ -1,6 +1,6 @@
 [global]
 name=iouring_write
-rw=randwrite
+rw=write
 direct=1
 ioengine=io_uring
 
@@ -13,10 +13,12 @@ time_based
 runtime=60
 
 ; controllable variables
-bs=4k
+bs=8k
 iodepth=128
 cpus_allowed=0-15
 numjobs=1
+
+iodepth_batch_submit=64
 
 ; Remote device
 [device]

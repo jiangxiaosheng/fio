@@ -482,6 +482,17 @@ static int cq_event_handler(struct thread_data *td, enum ibv_wc_opcode opcode)
 					struct io_uring_sqe *sqe;
 					int events = 0, max = 1, min = 1;
 					int r;
+
+					/* imitate fio's io_uring engine */
+					if (rd->req_nr == rd->ioring_iodepth) {
+						do {
+							r = ioring_reap_cq(td, 0, 1);
+						} while (r < 1);
+						rd->req_nr = 0;
+						// log_info("reaped %d cq events\n", r);
+					}
+					// r = ioring_reap_cq(td, 0, 1);
+					// log_info("reaped %d completions\n", r);
 					
 					while (true) {
 						sqe = ioring_get_sqe(td, (void *) r_io_u_d->rdma_sgl.addr, r_io_u_d->rdma_sgl.length);
@@ -495,6 +506,7 @@ static int cq_event_handler(struct thread_data *td, enum ibv_wc_opcode opcode)
 						} while (events < min);
 					}
 
+					rd->req_nr++;
 					rd->ioring_cur_sqes++;
 					if (rd->ioring_cur_sqes == rd->ioring_submit_batch) {
 						while (rd->ioring_cur_sqes != 0) {
@@ -504,6 +516,12 @@ static int cq_event_handler(struct thread_data *td, enum ibv_wc_opcode opcode)
 								// log_info("submit %d sqes\n", ret);
 							} else {
 								/* should reap the cq here */
+								do {
+									r = ioring_reap_cq(td, events, max);
+									events += r;
+									log_info("im busy\n");
+								} while (events < min);
+								
 								log_err("io_uring submit returns %d\n", ret);
 								return -1;
 							}
@@ -1013,9 +1031,6 @@ static int fio_rdma_ioring_commit(struct thread_data *td)
 			ret = 0;	/* must be a SYNC */
 
 		if (ret > 0) {
-			if (rd->is_client)
-				rd->req_nr += ret;
-
 			fio_rdma_ioring_queued(td, io_us, ret);
 			io_u_mark_submit(td, ret);
 			rd->io_u_queued_nr -= ret;

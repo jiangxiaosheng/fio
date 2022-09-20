@@ -538,6 +538,8 @@ static int fio_ioring_getevents(struct thread_data *td, unsigned int min,
 		}
 	} while (events < min);
 
+	// log_info("td->cur_depth is %d, got %d events\n", td->cur_depth, events);
+
 	return r < 0 ? r : events;
 }
 
@@ -560,8 +562,10 @@ static enum fio_q_status fio_ioring_queue(struct thread_data *td,
 
 	fio_ro_check(td, io_u);
 
-	if (ld->queued == ld->iodepth)
+	if (ld->queued == ld->iodepth) {
+		log_info("io_uring sq busy\n");
 		return FIO_Q_BUSY;
+	}
 
 	if (io_u->ddir == DDIR_TRIM) {
 		if (ld->queued)
@@ -575,8 +579,10 @@ static enum fio_q_status fio_ioring_queue(struct thread_data *td,
 
 	tail = *ring->tail;
 	next_tail = tail + 1;
-	if (next_tail == atomic_load_acquire(ring->head))
+	if (next_tail == atomic_load_acquire(ring->head)) {
+		log_info("io_uring sq busy\n");
 		return FIO_Q_BUSY;
+	}
 
 	if (ld->cmdprio.mode != CMDPRIO_MODE_NONE)
 		fio_ioring_cmdprio_prep(td, io_u);
@@ -646,6 +652,11 @@ static int fio_ioring_commit(struct thread_data *td)
 		unsigned start = *ld->sq_ring.head;
 		long nr = ld->queued;
 
+		// if (nr > 1)
+		// 	log_info("queued %d, iodepth_batch %d\n", nr, td->o.iodepth_batch);
+		// else
+		// 	log_info("what's wrong?\n");
+
 		ret = io_uring_enter(ld, nr, 0, IORING_ENTER_GETEVENTS);
 		if (ret > 0) {
 			fio_ioring_queued(td, start, ret);
@@ -658,6 +669,7 @@ static int fio_ioring_commit(struct thread_data *td)
 			continue;
 		} else {
 			if (errno == EAGAIN || errno == EINTR) {
+				log_info("io_uring_enter error\n");
 				ret = fio_ioring_cqring_reap(td, 0, ld->queued);
 				if (ret)
 					continue;

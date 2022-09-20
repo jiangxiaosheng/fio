@@ -437,6 +437,7 @@ enum fio_q_status td_io_queue(struct thread_data *td, struct io_u *io_u)
 		    (ddir_sync(io_u->ddir) && td->runstate != TD_FSYNCING))
 			td->ts.total_io_u[io_u->ddir]++;
 
+		// log_info("engine: iodepth_batch = %d, io_u_queued = %d\n", td->o.iodepth_batch, td->io_u_queued);
 		if (td->io_u_queued >= td->o.iodepth_batch)
 			td_io_commit(td);
 	}
